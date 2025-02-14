@@ -96,7 +96,7 @@ func Run(opts *Options) (int, error) {
 	var chunkList *ChunkList
 	var itemIndex int32
 	header := make([]string, 0, opts.HeaderLines)
-	if len(opts.WithNth) == 0 {
+	if opts.WithNth == nil {
 		chunkList = NewChunkList(cache, func(item *Item, data []byte) bool {
 			if len(header) < opts.HeaderLines {
 				header = append(header, byteString(data))
@@ -109,6 +109,7 @@ func Run(opts *Options) (int, error) {
 			return true
 		})
 	} else {
+		nthTransformer := opts.WithNth(opts.Delimiter)
 		chunkList = NewChunkList(cache, func(item *Item, data []byte) bool {
 			tokens := Tokenize(byteString(data), opts.Delimiter)
 			if opts.Ansi && opts.Theme.Colored && len(tokens) > 1 {
@@ -127,15 +128,13 @@ func Run(opts *Options) (int, error) {
 					}
 				}
 			}
-			trans := Transform(tokens, opts.WithNth)
-			transformed := joinTokens(trans)
+			transformed := nthTransformer(tokens)
 			if len(header) < opts.HeaderLines {
 				header = append(header, transformed)
 				eventBox.Set(EvtHeader, header)
 				return false
 			}
 			item.text, item.colors = ansiProcessor(stringBytes(transformed))
-			item.text.TrimTrailingWhitespaces()
 			item.text.Index = itemIndex
 			item.origText = &data
 			itemIndex++
@@ -172,7 +171,9 @@ func Run(opts *Options) (int, error) {
 			return chunkList.Push(data)
 		}, eventBox, executor, opts.ReadZero, opts.Filter == nil)
 
-		go reader.ReadSource(opts.Input, opts.WalkerRoot, opts.WalkerOpts, opts.WalkerSkip, initialReload, initialEnv)
+		readyChan := make(chan bool)
+		go reader.ReadSource(opts.Input, opts.WalkerRoot, opts.WalkerOpts, opts.WalkerSkip, initialReload, initialEnv, readyChan)
+		<-readyChan
 	}
 
 	// Matcher
@@ -186,16 +187,37 @@ func Run(opts *Options) (int, error) {
 			forward = false
 		case byBegin:
 			forward = true
+		case byPathname:
+			withPos = true
+			forward = false
 		}
 	}
-	patternCache := make(map[string]*Pattern)
-	patternBuilder := func(runes []rune) *Pattern {
-		return BuildPattern(cache, patternCache,
-			opts.Fuzzy, opts.FuzzyAlgo, opts.Extended, opts.Case, opts.Normalize, forward, withPos,
-			opts.Filter == nil, opts.Nth, opts.Delimiter, runes)
-	}
+
+	nth := opts.Nth
 	inputRevision := revision{}
 	snapshotRevision := revision{}
+	patternCache := make(map[string]*Pattern)
+	denyMutex := sync.Mutex{}
+	denylist := make(map[int32]struct{})
+	clearDenylist := func() {
+		denyMutex.Lock()
+		if len(denylist) > 0 {
+			patternCache = make(map[string]*Pattern)
+		}
+		denylist = make(map[int32]struct{})
+		denyMutex.Unlock()
+	}
+	patternBuilder := func(runes []rune) *Pattern {
+		denyMutex.Lock()
+		denylistCopy := make(map[int32]struct{})
+		for k, v := range denylist {
+			denylistCopy[k] = v
+		}
+		denyMutex.Unlock()
+		return BuildPattern(cache, patternCache,
+			opts.Fuzzy, opts.FuzzyAlgo, opts.Extended, opts.Case, opts.Normalize, forward, withPos,
+			opts.Filter == nil, nth, opts.Delimiter, inputRevision, runes, denylistCopy)
+	}
 	matcher := NewMatcher(cache, patternBuilder, sort, opts.Tac, eventBox, inputRevision)
 
 	// Filtering mode
@@ -224,7 +246,7 @@ func Run(opts *Options) (int, error) {
 					}
 					return false
 				}, eventBox, executor, opts.ReadZero, false)
-			reader.ReadSource(opts.Input, opts.WalkerRoot, opts.WalkerOpts, opts.WalkerSkip, initialReload, initialEnv)
+			reader.ReadSource(opts.Input, opts.WalkerRoot, opts.WalkerOpts, opts.WalkerSkip, initialReload, initialEnv, nil)
 		} else {
 			eventBox.Unwatch(EvtReadNew)
 			eventBox.WaitFor(EvtReadFin)
@@ -294,12 +316,17 @@ func Run(opts *Options) (int, error) {
 	var snapshot []*Chunk
 	var count int
 	restart := func(command commandSpec, environ []string) {
+		if !useSnapshot {
+			clearDenylist()
+		}
 		reading = true
 		chunkList.Clear()
 		itemIndex = 0
 		inputRevision.bumpMajor()
 		header = make([]string, 0, opts.HeaderLines)
-		go reader.restart(command, environ)
+		readyChan := make(chan bool)
+		go reader.restart(command, environ, readyChan)
+		<-readyChan
 	}
 
 	exitCode := ExitOk
@@ -338,7 +365,8 @@ func Run(opts *Options) (int, error) {
 					} else {
 						reading = reading && evt == EvtReadNew
 					}
-					if useSnapshot && evt == EvtReadFin {
+					if useSnapshot && evt == EvtReadFin { // reload-sync
+						clearDenylist()
 						useSnapshot = false
 					}
 					if !useSnapshot {
@@ -369,6 +397,25 @@ func Run(opts *Options) (int, error) {
 						command = val.command
 						environ = val.environ
 						changed = val.changed
+						bump := false
+						if len(val.denylist) > 0 && val.revision.compatible(inputRevision) {
+							denyMutex.Lock()
+							for _, itemIndex := range val.denylist {
+								denylist[itemIndex] = struct{}{}
+							}
+							denyMutex.Unlock()
+							bump = true
+						}
+						if val.nth != nil {
+							// Change nth and clear caches
+							nth = *val.nth
+							bump = true
+						}
+						if bump {
+							patternCache = make(map[string]*Pattern)
+							cache.Clear()
+							inputRevision.bumpMinor()
+						}
 						if command != nil {
 							useSnapshot = val.sync
 						}
